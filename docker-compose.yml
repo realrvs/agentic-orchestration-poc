@@ -1,0 +1,237 @@
+services:
+
+  # ─── PostgreSQL (общая БД для Camunda, audit, Langfuse) ─────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: poc-postgres
+    profiles: ["core", "llm", "obs", "mcp", "full"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-poc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-poc_secret}
+      POSTGRES_MULTIPLE_DATABASES: orchestration,langfuse
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres-init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-poc}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - poc-network
+
+  # ─── Elasticsearch (для Camunda Operate / Tasklist) ─────────────
+  # Camunda 8.8 больше не включает Elasticsearch в all-in-one образ
+  # https://docs.camunda.io/docs/self-managed/setup/deploy/other/docker/
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    container_name: poc-elasticsearch
+    profiles: ["core", "llm", "obs", "mcp", "full"]
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx1g
+      - bootstrap.memory_lock=true
+      - cluster.name=camunda-poc
+      - node.name=poc-node
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
+    networks:
+      - poc-network
+
+  # ─── Camunda 8 (all-in-one) ─────────────────────────────────────
+  # Включает: Zeebe, Operate, Tasklist, Connectors, Identity
+  # Порт 8888 — потому что 8080 занят локальным Tomcat
+  # Auth: basic (demo/demo) — Camunda 8.8 не поддерживает "none"
+  # Elasticsearch — отдельный контейнер (см. выше)
+  #
+  # Документация: https://docs.camunda.io/docs/self-managed/setup/deploy/other/docker/
+  camunda:
+    image: camunda/camunda:8.8.0
+    container_name: poc-camunda
+    profiles: ["core", "llm", "obs", "mcp", "full"]
+    environment:
+      # ─── Zeebe ────────────────────────────────────────────────────
+      CAMUNDA_SECURITY_AUTHENTICATION_UNPROTECTEDAPI: "true"
+      CAMUNDA_SECURITY_AUTHORIZATIONS_ENABLED: "false"
+      CAMUNDA_SECURITY_AUTHENTICATION_METHOD: "basic"
+
+      # ─── Демо-пользователь (basic auth) ──────────────────────────
+      CAMUNDA_SECURITY_INITIALIZATION_USERS_0_USERNAME: "demo"
+      CAMUNDA_SECURITY_INITIALIZATION_USERS_0_PASSWORD: "demo"
+      CAMUNDA_SECURITY_INITIALIZATION_USERS_0_NAME: "Demo User"
+      CAMUNDA_SECURITY_INITIALIZATION_USERS_0_EMAIL: "demo@example.com"
+
+      # ─── Elasticsearch (unified configuration, Camunda 8.8+) ─────
+      CAMUNDA_DATA_SECONDARYSTORAGE_ELASTICSEARCH_URL: "http://elasticsearch:9200"
+      CAMUNDA_DATA_SECONDARYSTORAGE_ELASTICSEARCH_CLUSTERNAME: "camunda-poc"
+
+      # ─── Дополнительные настройки ────────────────────────────────
+      JAVA_OPTS: "-Xms512m -Xmx2g"
+      ZEEBE_GATEWAY_SECURITY_ENABLED: "false"
+    ports:
+      - "8888:8080"   # Operate / Tasklist / Web Modeler (8080 занят Tomcat)
+      - "26500:26500" # Zeebe gRPC
+      - "9600:9600"   # Zeebe monitoring
+    volumes:
+      - camunda-data:/usr/local/camunda/data
+      - ./bpmn:/usr/local/camunda/bpmn:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+      start_period: 180s
+    networks:
+      - poc-network
+
+  # ─── Ollama (локальная LLM) ─────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: poc-ollama
+    profiles: ["llm", "full"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: "24h"
+      OLLAMA_HOST: "0.0.0.0:11434"
+    # Для GPU: раскомментируйте (нужен nvidia-container-toolkit)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - poc-network
+
+  # ─── Jaeger (распределённый трейсинг) ───────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: poc-jaeger
+    profiles: ["obs", "full"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+      - "6831:6831/udp" # Jaeger agent
+    networks:
+      - poc-network
+
+  # ─── Langfuse (LLM observability) ───────────────────────────────
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: poc-langfuse
+    profiles: ["obs", "full"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-poc}:${POSTGRES_PASSWORD:-poc_secret}@postgres:5432/langfuse
+      NEXTAUTH_SECRET: "poc-secret-change-in-production"
+      SALT: "poc-salt-change-in-production"
+      NEXTAUTH_URL: http://localhost:3001
+      TELEMETRY_ENABLED: "false"
+    ports:
+      - "3001:3000"
+    networks:
+      - poc-network
+
+  # ─── MCP Gateway (единая точка входа для агентов) ───────────────
+  mcp-gateway:
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile.gateway
+    container_name: poc-mcp-gateway
+    profiles: ["mcp", "full"]
+    environment:
+      MCP_EIS_URL: http://mcp-eis:8081
+      MCP_SAP_URL: http://mcp-sap:8082
+      MCP_1C_URL: http://mcp-1c:8083
+      AUDIT_DB_URL: postgresql://${POSTGRES_USER:-poc}:${POSTGRES_PASSWORD:-poc_secret}@postgres:5432/orchestration
+    ports:
+      - "8090:8080"  # MCP Gateway на 8090
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - poc-network
+
+  # ─── MCP Server: EIS (mock) ─────────────────────────────────────
+  mcp-eis:
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile.eis
+    container_name: poc-mcp-eis
+    profiles: ["mcp", "full"]
+    ports:
+      - "8081:8081"
+    networks:
+      - poc-network
+
+  # ─── MCP Server: SAP (mock) ─────────────────────────────────────
+  mcp-sap:
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile.sap
+    container_name: poc-mcp-sap
+    profiles: ["mcp", "full"]
+    ports:
+      - "8082:8082"
+    networks:
+      - poc-network
+
+  # ─── MCP Server: 1C (mock) ──────────────────────────────────────
+  mcp-1c:
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile.1c
+    container_name: poc-mcp-1c
+    profiles: ["mcp", "full"]
+    ports:
+      - "8083:8083"
+    networks:
+      - poc-network
+
+volumes:
+  postgres-data:
+  camunda-data:
+  ollama-data:
+  elasticsearch-data:
+
+networks:
+  poc-network:
+    driver: bridge
