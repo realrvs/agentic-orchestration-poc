@@ -26,15 +26,14 @@
       <bpmn:outgoing>Flow_2</bpmn:outgoing>
     </bpmn:serviceTask>
 
-    <!-- User Task: approval-form -->
-    <bpmn:userTask id="Task_Approval" name="Approve request">
+    <!-- Service Task: approve (replaces User Task for PoC) -->
+    <bpmn:serviceTask id="Task_Approval" name="Approve request">
       <bpmn:extensionElements>
-        <zeebe:formDefinition formKey="approval-form" />
-        <zeebe:assignmentDefinition assignee="demo" />
+        <zeebe:taskDefinition type="approve-request" retries="2" />
       </bpmn:extensionElements>
       <bpmn:incoming>Flow_2</bpmn:incoming>
       <bpmn:outgoing>Flow_3</bpmn:outgoing>
-    </bpmn:userTask>
+    </bpmn:serviceTask>
 
     <!-- Service Task: llm-agent -->
     <bpmn:serviceTask id="Task_LLM" name="LLM Agent (analyze)">
