@@ -4,8 +4,9 @@ Python worker for PoC Procurement Process.
 Handles Service Tasks:
 - validate-request: mock validation of incoming request
 - approve-request: auto-approve (replaces User Task for PoC)
-- llm-agent: LLM-based analysis via local Ollama
+- llm-agent: LLM-based analysis via local Ollama (Mistral 7B)
 - tool-executor: Policy Enforcement Point (RBAC + confidence threshold)
+- mcp-gateway: MCP Gateway integration for legacy systems
 
 Connects to Camunda 8 Zeebe via gRPC (localhost:26500).
 """
@@ -30,6 +31,7 @@ from tool_contract import (
 CAMUNDA_ADDRESS = os.getenv("CAMUNDA_ZEEBE_GATEWAY_ADDRESS", "localhost:26500")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b-instruct-q4_K_M")
+MCP_GATEWAY_URL = os.getenv("MCP_GATEWAY_URL", "http://localhost:8000")
 
 LLM_AGENT_SVID = "spiffe://company.ru/agents/llm_agent_v1"
 
@@ -231,6 +233,89 @@ async def handle_tool_executor(job: Job) -> dict[str, Any]:
     }
 
 
+async def handle_mcp_gateway(job: Job) -> dict[str, Any]:
+    """
+    MCP Gateway - call legacy systems via Model Context Protocol.
+
+    Input:
+        policy_decision, amount, comment
+
+    Output:
+        mcp_status, mcp_notice_id, mcp_message
+    """
+    variables = job.variables
+    policy_decision = variables.get("policy_decision", "DENY")
+    amount = variables.get("amount", 0)
+    comment = variables.get("comment", "")
+
+    print(f"[mcp-gateway] Policy decision: {policy_decision}")
+
+    if policy_decision != "ALLOW":
+        print(f"[mcp-gateway] Skipping - policy decision is {policy_decision}")
+        return {
+            "mcp_status": "SKIPPED",
+            "mcp_reason": f"Policy decision was {policy_decision}",
+        }
+
+    print(f"[mcp-gateway] Calling MCP Gateway at {MCP_GATEWAY_URL}...")
+
+    # JSON-RPC 2.0 payload for MCP tools/call
+    rpc_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "publish_notice",
+            "arguments": {
+                "title": comment,
+                "amount": float(amount),
+                "region": "Moscow",
+            },
+        },
+        "id": 1,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{MCP_GATEWAY_URL}/mcp/messages",
+                json=rpc_payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Agent-SVID": LLM_AGENT_SVID,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        # Parse MCP response
+        content = data.get("result", {}).get("content", [])
+        if content and len(content) > 0:
+            raw_text = content[0].get("text", "{}")
+            mcp_result = json.loads(raw_text)
+        else:
+            mcp_result = {"status": "UNKNOWN"}
+
+        status = mcp_result.get("status", "UNKNOWN")
+        notice_id = mcp_result.get("notice_id", "N/A")
+        message = mcp_result.get("message", "")
+
+        print(f"[mcp-gateway] MCP status: {status}")
+        print(f"[mcp-gateway] Notice ID: {notice_id}")
+
+        return {
+            "mcp_status": status,
+            "mcp_notice_id": notice_id,
+            "mcp_message": message,
+        }
+
+    except Exception as e:
+        print(f"[mcp-gateway] ERROR: {e}")
+        return {
+            "mcp_status": "ERROR",
+            "mcp_reason": str(e),
+        }
+
+
 # ─── Main ─────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -243,12 +328,14 @@ async def main() -> None:
     worker.task(task_type="approve-request")(handle_approve_request)
     worker.task(task_type="llm-agent")(handle_llm_agent)
     worker.task(task_type="tool-executor")(handle_tool_executor)
+    worker.task(task_type="mcp-gateway")(handle_mcp_gateway)
 
     print("Worker started. Listening for tasks:")
     print("  - validate-request")
     print("  - approve-request")
     print(f"  - llm-agent (model: {OLLAMA_MODEL})")
     print("  - tool-executor (Policy Enforcement Point)")
+    print(f"  - mcp-gateway (MCP Gateway: {MCP_GATEWAY_URL})")
     print()
 
     await worker.work()

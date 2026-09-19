@@ -53,6 +53,15 @@
       <bpmn:outgoing>Flow_5</bpmn:outgoing>
     </bpmn:serviceTask>
 
+    <!-- Service Task: mcp-gateway -->
+    <bpmn:serviceTask id="Task_MCPGateway" name="MCP Gateway (Legacy)">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="mcp-gateway" retries="2" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_5</bpmn:incoming>
+      <bpmn:outgoing>Flow_5a</bpmn:outgoing>
+    </bpmn:serviceTask>
+
     <!-- XOR Gateway -->
     <bpmn:exclusiveGateway id="Gateway_Approved" name="Approved?" default="Flow_Rejected">
       <bpmn:incoming>Flow_5</bpmn:incoming>
@@ -75,7 +84,8 @@
     <bpmn:sequenceFlow id="Flow_2" sourceRef="Task_Validate" targetRef="Task_Approval" />
     <bpmn:sequenceFlow id="Flow_3" sourceRef="Task_Approval" targetRef="Task_LLM" />
     <bpmn:sequenceFlow id="Flow_4" sourceRef="Task_LLM" targetRef="Task_ToolExecutor" />
-    <bpmn:sequenceFlow id="Flow_5" sourceRef="Task_ToolExecutor" targetRef="Gateway_Approved" />
+    <bpmn:sequenceFlow id="Flow_5" sourceRef="Task_ToolExecutor" targetRef="Task_MCPGateway" />
+    <bpmn:sequenceFlow id="Flow_5a" sourceRef="Task_MCPGateway" targetRef="Gateway_Approved" />
 
     <bpmn:sequenceFlow id="Flow_Approved" name="Approved" sourceRef="Gateway_Approved" targetRef="End_Approved">
       <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">= approved = true</bpmn:conditionExpression>
@@ -103,10 +113,13 @@
       <bpmndi:BPMNShape id="Task_ToolExecutor_di" bpmnElement="Task_ToolExecutor">
         <dc:Bounds x="690" y="80" width="100" height="80" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="Gateway_Approved_di" bpmnElement="Gateway_Approved" isMarkerVisible="true">
-        <dc:Bounds x="845" y="95" width="50" height="50" />
+      <bpmndi:BPMNShape id="Task_MCPGateway_di" bpmnElement="Task_MCPGateway">
+        <dc:Bounds x="840" y="80" width="100" height="80" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="End_Approved_di" bpmnElement="End_Approved">
+            <bpmndi:BPMNShape id="Gateway_Approved_di" bpmnElement="Gateway_Approved" isMarkerVisible="true">
+        <dc:Bounds x="995" y="95" width="50" height="50" />
+      </bpmndi:BPMNShape>
+            <bpmndi:BPMNShape id="End_Approved_di" bpmnElement="End_Approved">
         <dc:Bounds x="952" y="102" width="36" height="36" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="End_Rejected_di" bpmnElement="End_Rejected">
@@ -130,7 +143,11 @@
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_5_di" bpmnElement="Flow_5">
         <di:waypoint x="790" y="120" />
-        <di:waypoint x="845" y="120" />
+        <di:waypoint x="840" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_5a_di" bpmnElement="Flow_5a">
+        <di:waypoint x="940" y="120" />
+        <di:waypoint x="995" y="120" />
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_Approved_di" bpmnElement="Flow_Approved">
         <di:waypoint x="895" y="120" />
