@@ -305,7 +305,19 @@ agentic-orchestration-poc/
 
 ---
 
-## Links
+## Integration with MCP Gateway
+
+The process integrates with [mcp-gateway-poc](https://github.com/realrvs/mcp-gateway-poc) via Service Task `mcp-gateway`:
+
+- MCP transport: SSE + JSON-RPC 2.0
+- RBAC via X-Agent-SVID header
+- Tool: `publish_notice` (EIS mock)
+- Audit log in mcp-postgres
+
+**Verified Result:**
+- `mcp_status` = `SUCCESS`
+- `mcp_notice_id` = `EIS-2026-MOSCOW-5679`
+- `mcp_message` = "Закупка ... успешно зарегистрирована"
 
 - **Blueprint:** [github.com/realrvs/enterprise-agent-orchestration-blueprint](https://github.com/realrvs/enterprise-agent-orchestration-blueprint)
 - **Reference implementation (Day 1-5):** [github.com/realrvs/camunda](https://github.com/realrvs/camunda)
