@@ -250,6 +250,24 @@ python run_process.py
 
 ---
 
+## Integration with MCP Gateway
+
+Процесс интегрирован с [mcp-gateway-poc](https://github.com/realrvs/mcp-gateway-poc) через Service Task `mcp-gateway`:
+
+- **MCP transport:** SSE + JSON-RPC 2.0
+- **RBAC:** через `X-Agent-SVID` header
+- **Tool:** `publish_notice` (EIS mock)
+- **Audit log:** в `mcp-postgres`
+
+**Verified Result (Instance v4):**
+- `mcp_status` = `SUCCESS`
+- `mcp_notice_id` = `EIS-2026-MOSCOW-5679`
+- `mcp_message` = "Закупка 'Purchase of server hardware' на сумму 1,500,000.00 руб. в регионе Moscow успешно зарегистрирована."
+
+### BPMN Structure (v4)
+Start → Validate → Approve → LLM Agent → Tool Executor →
+MCP Gateway → XOR Gateway → End: Approved
+
 ## Repository Structure
 
 ```
