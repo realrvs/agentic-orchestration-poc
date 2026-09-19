@@ -9,6 +9,7 @@ Handles Service Tasks:
 - mcp-gateway: MCP Gateway integration for legacy systems
 
 Connects to Camunda 8 Zeebe via gRPC (localhost:26500).
+Traces spans to Jaeger via OpenTelemetry (localhost:4318).
 """
 
 import asyncio
@@ -26,6 +27,7 @@ from tool_contract import (
     CONFIDENCE_THRESHOLD,
     ALLOWED_SVIDS,
 )
+from tracing import setup_tracing, span, set_success
 
 
 CAMUNDA_ADDRESS = os.getenv("CAMUNDA_ZEEBE_GATEWAY_ADDRESS", "localhost:26500")
@@ -44,31 +46,43 @@ async def handle_validate_request(job: Job) -> dict[str, Any]:
     request_id = variables.get("request_id", "unknown")
     amount = variables.get("amount", 0)
     comment = variables.get("comment", "")
+    trace_id = variables.get("trace_id")
 
-    print(f"[validate-request] Processing request_id={request_id}, "
-          f"amount={amount}, comment='{comment}'")
+    with span("validate-request", trace_id=trace_id, attributes={
+        "request_id": request_id,
+        "amount": amount,
+    }) as current_span:
+        print(f"[validate-request] Processing request_id={request_id}, "
+              f"amount={amount}, comment='{comment}'")
 
-    errors = []
-    if not request_id or request_id == "unknown":
-        errors.append("request_id is missing")
-    if amount <= 0:
-        errors.append(f"amount must be positive (got {amount})")
-    if not comment or len(comment.strip()) < 3:
-        errors.append("comment must be at least 3 characters")
+        errors = []
+        if not request_id or request_id == "unknown":
+            errors.append("request_id is missing")
+        if amount <= 0:
+            errors.append(f"amount must be positive (got {amount})")
+        if not comment or len(comment.strip()) < 3:
+            errors.append("comment must be at least 3 characters")
 
-    if errors:
-        reason = "; ".join(errors)
-        print(f"[validate-request] INVALID: {reason}")
-        return {"valid": False, "validation_reason": reason}
+        if errors:
+            reason = "; ".join(errors)
+            print(f"[validate-request] INVALID: {reason}")
+            set_success(current_span, valid=False, reason=reason)
+            return {"valid": False, "validation_reason": reason}
 
-    print(f"[validate-request] VALID")
-    return {"valid": True, "validation_reason": "All checks passed"}
+        print(f"[validate-request] VALID")
+        set_success(current_span, valid=True)
+        return {"valid": True, "validation_reason": "All checks passed"}
 
 
 async def handle_approve_request(job: Job) -> dict[str, Any]:
     """Auto-approve for PoC testing (replaces User Task)."""
-    print(f"[approve-request] Auto-approving request")
-    return {"approved": True}
+    variables = job.variables
+    trace_id = variables.get("trace_id")
+
+    with span("approve-request", trace_id=trace_id) as current_span:
+        print(f"[approve-request] Auto-approving request")
+        set_success(current_span, approved=True)
+        return {"approved": True}
 
 
 async def handle_llm_agent(job: Job) -> dict[str, Any]:
@@ -82,68 +96,76 @@ async def handle_llm_agent(job: Job) -> dict[str, Any]:
     amount = variables.get("amount", 0)
     comment = variables.get("comment", "")
     valid = variables.get("valid", False)
+    trace_id = variables.get("trace_id")
 
-    if not valid:
-        print(f"[llm-agent] Skipping - request is invalid")
-        return {
-            "llm_decision": "skip",
-            "llm_confidence": 0.0,
-            "llm_reasoning": "Request was invalid",
-            "agent_svid": LLM_AGENT_SVID,
-        }
+    with span("llm-agent", trace_id=trace_id, attributes={
+        "model": OLLAMA_MODEL,
+        "amount": amount,
+    }) as current_span:
+        if not valid:
+            print(f"[llm-agent] Skipping - request is invalid")
+            set_success(current_span, decision="skip")
+            return {
+                "llm_decision": "skip",
+                "llm_confidence": 0.0,
+                "llm_reasoning": "Request was invalid",
+                "agent_svid": LLM_AGENT_SVID,
+            }
 
-    prompt = (
-        f"You are a procurement committee agent. Analyze the request:\n"
-        f"- Amount: {amount} RUB\n"
-        f"- Comment: {comment}\n\n"
-        f"Respond with strict JSON only (no markdown):\n"
-        f'{{"decision": "approve" or "reject", '
-        f'"confidence": number from 0 to 1, '
-        f'"reasoning": "brief justification"}}'
-    )
+        prompt = (
+            f"You are a procurement committee agent. Analyze the request:\n"
+            f"- Amount: {amount} RUB\n"
+            f"- Comment: {comment}\n\n"
+            f"Respond with strict JSON only (no markdown):\n"
+            f'{{"decision": "approve" or "reject", '
+            f'"confidence": number from 0 to 1, '
+            f'"reasoning": "brief justification"}}'
+        )
 
-    print(f"[llm-agent] Sending prompt to Ollama ({OLLAMA_MODEL})...")
+        print(f"[llm-agent] Sending prompt to Ollama ({OLLAMA_MODEL})...")
 
-    try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            response = await client.post(
-                f"{OLLAMA_HOST}/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                    "format": "json",
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                response = await client.post(
+                    f"{OLLAMA_HOST}/api/generate",
+                    json={
+                        "model": OLLAMA_MODEL,
+                        "prompt": prompt,
+                        "stream": False,
+                        "format": "json",
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
 
-        raw_response = data.get("response", "{}")
-        print(f"[llm-agent] Ollama response: {raw_response[:300]}")
+            raw_response = data.get("response", "{}")
+            print(f"[llm-agent] Ollama response: {raw_response[:300]}")
 
-        parsed = json.loads(raw_response)
+            parsed = json.loads(raw_response)
 
-        decision = parsed.get("decision", "unknown")
-        confidence = float(parsed.get("confidence", 0.0))
-        reasoning = parsed.get("reasoning", "")
+            decision = parsed.get("decision", "unknown")
+            confidence = float(parsed.get("confidence", 0.0))
+            reasoning = parsed.get("reasoning", "")
 
-        print(f"[llm-agent] LLM decision: {decision} (confidence: {confidence})")
+            print(f"[llm-agent] LLM decision: {decision} (confidence: {confidence})")
 
-        return {
-            "llm_decision": decision,
-            "llm_confidence": confidence,
-            "llm_reasoning": reasoning,
-            "agent_svid": LLM_AGENT_SVID,
-        }
+            set_success(current_span, decision=decision, confidence=confidence)
+            return {
+                "llm_decision": decision,
+                "llm_confidence": confidence,
+                "llm_reasoning": reasoning,
+                "agent_svid": LLM_AGENT_SVID,
+            }
 
-    except Exception as e:
-        print(f"[llm-agent] ERROR: {e}")
-        return {
-            "llm_decision": "error",
-            "llm_confidence": 0.0,
-            "llm_reasoning": str(e),
-            "agent_svid": LLM_AGENT_SVID,
-        }
+        except Exception as e:
+            print(f"[llm-agent] ERROR: {e}")
+            current_span.set_attribute("error", str(e))
+            return {
+                "llm_decision": "error",
+                "llm_confidence": 0.0,
+                "llm_reasoning": str(e),
+                "agent_svid": LLM_AGENT_SVID,
+            }
 
 
 async def handle_tool_executor(job: Job) -> dict[str, Any]:
@@ -161,76 +183,78 @@ async def handle_tool_executor(job: Job) -> dict[str, Any]:
     llm_confidence = float(variables.get("llm_confidence", 0.0))
     llm_reasoning = variables.get("llm_reasoning", "")
     agent_svid = variables.get("agent_svid", LLM_AGENT_SVID)
+    trace_id = variables.get("trace_id")
 
-    print(f"[tool-executor] Evaluating recommendation:")
-    print(f"  decision   = {llm_decision}")
-    print(f"  confidence = {llm_confidence}")
-    print(f"  svid       = {agent_svid}")
+    with span("tool-executor", trace_id=trace_id, attributes={
+        "confidence": llm_confidence,
+        "svid": agent_svid,
+    }) as current_span:
+        print(f"[tool-executor] Evaluating recommendation:")
+        print(f"  decision   = {llm_decision}")
+        print(f"  confidence = {llm_confidence}")
+        print(f"  svid       = {agent_svid}")
 
-    # Build RecommendationDTO
-    try:
-        dto = RecommendationDTO(
-            tool_name=ToolName.SEND_NOTIFICATION,
-            confidence=llm_confidence,
-            reasoning=llm_reasoning or "no reasoning provided",
-            parameters={},
-            agent_svid=agent_svid,
-        )
-    except Exception as e:
-        print(f"[tool-executor] INVALID DTO: {e}")
-        return {
-            "policy_decision": "DENY",
-            "policy_reason": f"Invalid RecommendationDTO: {e}",
+        # Build RecommendationDTO
+        try:
+            dto = RecommendationDTO(
+                tool_name=ToolName.SEND_NOTIFICATION,
+                confidence=llm_confidence,
+                reasoning=llm_reasoning or "no reasoning provided",
+                parameters={},
+                agent_svid=agent_svid,
+            )
+        except Exception as e:
+            print(f"[tool-executor] INVALID DTO: {e}")
+            set_success(current_span, decision="DENY", reason="invalid_dto")
+            return {
+                "policy_decision": "DENY",
+                "policy_reason": f"Invalid RecommendationDTO: {e}",
+            }
+
+        # Policy checks
+        reasons = []
+        allowed = True
+
+        if dto.agent_svid not in ALLOWED_SVIDS:
+            allowed = False
+            reasons.append(f"SVID not in allow-list: {dto.agent_svid}")
+        else:
+            reasons.append("SVID OK")
+
+        if dto.confidence < CONFIDENCE_THRESHOLD:
+            allowed = False
+            reasons.append(
+                f"Confidence {dto.confidence:.2f} < threshold {CONFIDENCE_THRESHOLD:.2f}"
+            )
+        else:
+            reasons.append(f"Confidence OK ({dto.confidence:.2f})")
+
+        reasons.append(f"Tool OK ({dto.tool_name.value})")
+
+        if dto.confidence < CONFIDENCE_THRESHOLD and llm_decision == "approve":
+            allowed = False
+            reasons.append("LLM approved but confidence below threshold")
+
+        policy_reason = "; ".join(reasons)
+        policy_decision = "ALLOW" if allowed else "DENY"
+
+        print(f"[tool-executor] Policy decision: {policy_decision}")
+        print(f"[tool-executor] Reason: {policy_reason}")
+
+        audit_entry = {
+            "agent_svid": dto.agent_svid,
+            "tool": dto.tool_name.value,
+            "confidence": dto.confidence,
+            "decision": policy_decision,
+            "reason": policy_reason,
         }
+        print(f"[AUDIT] {json.dumps(audit_entry, ensure_ascii=False)}")
 
-    # Policy checks
-    reasons = []
-    allowed = True
-
-    # 1. SVID check (RBAC)
-    if dto.agent_svid not in ALLOWED_SVIDS:
-        allowed = False
-        reasons.append(f"SVID not in allow-list: {dto.agent_svid}")
-    else:
-        reasons.append("SVID OK")
-
-    # 2. Confidence threshold
-    if dto.confidence < CONFIDENCE_THRESHOLD:
-        allowed = False
-        reasons.append(
-            f"Confidence {dto.confidence:.2f} < threshold {CONFIDENCE_THRESHOLD:.2f}"
-        )
-    else:
-        reasons.append(f"Confidence OK ({dto.confidence:.2f})")
-
-    # 3. Tool allow-list (enforced by enum)
-    reasons.append(f"Tool OK ({dto.tool_name.value})")
-
-    # 4. Decision consistency
-    if dto.confidence < CONFIDENCE_THRESHOLD and llm_decision == "approve":
-        allowed = False
-        reasons.append("LLM approved but confidence below threshold")
-
-    policy_reason = "; ".join(reasons)
-    policy_decision = "ALLOW" if allowed else "DENY"
-
-    print(f"[tool-executor] Policy decision: {policy_decision}")
-    print(f"[tool-executor] Reason: {policy_reason}")
-
-    # Audit log
-    audit_entry = {
-        "agent_svid": dto.agent_svid,
-        "tool": dto.tool_name.value,
-        "confidence": dto.confidence,
-        "decision": policy_decision,
-        "reason": policy_reason,
-    }
-    print(f"[AUDIT] {json.dumps(audit_entry, ensure_ascii=False)}")
-
-    return {
-        "policy_decision": policy_decision,
-        "policy_reason": policy_reason,
-    }
+        set_success(current_span, decision=policy_decision)
+        return {
+            "policy_decision": policy_decision,
+            "policy_reason": policy_reason,
+        }
 
 
 async def handle_mcp_gateway(job: Job) -> dict[str, Any]:
@@ -247,78 +271,86 @@ async def handle_mcp_gateway(job: Job) -> dict[str, Any]:
     policy_decision = variables.get("policy_decision", "DENY")
     amount = variables.get("amount", 0)
     comment = variables.get("comment", "")
+    trace_id = variables.get("trace_id")
 
-    print(f"[mcp-gateway] Policy decision: {policy_decision}")
+    with span("mcp-gateway", trace_id=trace_id, attributes={
+        "policy_decision": policy_decision,
+    }) as current_span:
+        print(f"[mcp-gateway] Policy decision: {policy_decision}")
 
-    if policy_decision != "ALLOW":
-        print(f"[mcp-gateway] Skipping - policy decision is {policy_decision}")
-        return {
-            "mcp_status": "SKIPPED",
-            "mcp_reason": f"Policy decision was {policy_decision}",
-        }
+        if policy_decision != "ALLOW":
+            print(f"[mcp-gateway] Skipping - policy decision is {policy_decision}")
+            set_success(current_span, status="SKIPPED")
+            return {
+                "mcp_status": "SKIPPED",
+                "mcp_reason": f"Policy decision was {policy_decision}",
+            }
 
-    print(f"[mcp-gateway] Calling MCP Gateway at {MCP_GATEWAY_URL}...")
+        print(f"[mcp-gateway] Calling MCP Gateway at {MCP_GATEWAY_URL}...")
 
-    # JSON-RPC 2.0 payload for MCP tools/call
-    rpc_payload = {
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {
-            "name": "publish_notice",
-            "arguments": {
-                "title": comment,
-                "amount": float(amount),
-                "region": "Moscow",
-            },
-        },
-        "id": 1,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{MCP_GATEWAY_URL}/mcp/messages",
-                json=rpc_payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Agent-SVID": LLM_AGENT_SVID,
+        rpc_payload = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "publish_notice",
+                "arguments": {
+                    "title": comment,
+                    "amount": float(amount),
+                    "region": "Moscow",
                 },
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        # Parse MCP response
-        content = data.get("result", {}).get("content", [])
-        if content and len(content) > 0:
-            raw_text = content[0].get("text", "{}")
-            mcp_result = json.loads(raw_text)
-        else:
-            mcp_result = {"status": "UNKNOWN"}
-
-        status = mcp_result.get("status", "UNKNOWN")
-        notice_id = mcp_result.get("notice_id", "N/A")
-        message = mcp_result.get("message", "")
-
-        print(f"[mcp-gateway] MCP status: {status}")
-        print(f"[mcp-gateway] Notice ID: {notice_id}")
-
-        return {
-            "mcp_status": status,
-            "mcp_notice_id": notice_id,
-            "mcp_message": message,
+            },
+            "id": 1,
         }
 
-    except Exception as e:
-        print(f"[mcp-gateway] ERROR: {e}")
-        return {
-            "mcp_status": "ERROR",
-            "mcp_reason": str(e),
-        }
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{MCP_GATEWAY_URL}/mcp/messages",
+                    json=rpc_payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Agent-SVID": LLM_AGENT_SVID,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            content = data.get("result", {}).get("content", [])
+            if content and len(content) > 0:
+                raw_text = content[0].get("text", "{}")
+                mcp_result = json.loads(raw_text)
+            else:
+                mcp_result = {"status": "UNKNOWN"}
+
+            status = mcp_result.get("status", "UNKNOWN")
+            notice_id = mcp_result.get("notice_id", "N/A")
+            message = mcp_result.get("message", "")
+
+            print(f"[mcp-gateway] MCP status: {status}")
+            print(f"[mcp-gateway] Notice ID: {notice_id}")
+
+            set_success(current_span, status=status, notice_id=notice_id)
+            return {
+                "mcp_status": status,
+                "mcp_notice_id": notice_id,
+                "mcp_message": message,
+            }
+
+        except Exception as e:
+            print(f"[mcp-gateway] ERROR: {e}")
+            current_span.set_attribute("error", str(e))
+            return {
+                "mcp_status": "ERROR",
+                "mcp_reason": str(e),
+            }
 
 
 # ─── Main ─────────────────────────────────────────────────────────
 
 async def main() -> None:
+    # Инициализировать OpenTelemetry tracing
+    setup_tracing()
+
     print(f"Connecting to Zeebe at {CAMUNDA_ADDRESS}...")
     hostname, port = CAMUNDA_ADDRESS.split(":")
     channel = create_insecure_channel(hostname=hostname, port=int(port))
