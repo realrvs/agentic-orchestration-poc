@@ -8,8 +8,9 @@ Handles Service Tasks:
 - tool-executor: Policy Enforcement Point (RBAC + confidence threshold)
 - mcp-gateway: MCP Gateway integration for legacy systems
 
-Connects to Camunda 8 Zeebe via gRPC (localhost:26500).
-Traces spans to Jaeger via OpenTelemetry (localhost:4318).
+Observability:
+- OpenTelemetry tracing to Jaeger (localhost:4318)
+- Langfuse LLM observability (localhost:3001)
 """
 
 import asyncio
@@ -28,6 +29,7 @@ from tool_contract import (
     ALLOWED_SVIDS,
 )
 from tracing import setup_tracing, span, set_success
+from langfuse_client import llm_generation
 
 
 CAMUNDA_ADDRESS = os.getenv("CAMUNDA_ZEEBE_GATEWAY_ADDRESS", "localhost:26500")
@@ -89,8 +91,7 @@ async def handle_llm_agent(job: Job) -> dict[str, Any]:
     """
     LLM agent - analyze request using local Ollama.
 
-    Input: amount, comment, valid
-    Output: llm_decision, llm_confidence, llm_reasoning, agent_svid
+    Traced to Jaeger (timing) and Langfuse (content + tokens).
     """
     variables = job.variables
     amount = variables.get("amount", 0)
@@ -124,48 +125,71 @@ async def handle_llm_agent(job: Job) -> dict[str, Any]:
 
         print(f"[llm-agent] Sending prompt to Ollama ({OLLAMA_MODEL})...")
 
-        try:
-            async with httpx.AsyncClient(timeout=180.0) as client:
-                response = await client.post(
-                    f"{OLLAMA_HOST}/api/generate",
-                    json={
-                        "model": OLLAMA_MODEL,
-                        "prompt": prompt,
-                        "stream": False,
-                        "format": "json",
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-
-            raw_response = data.get("response", "{}")
-            print(f"[llm-agent] Ollama response: {raw_response[:300]}")
-
-            parsed = json.loads(raw_response)
-
-            decision = parsed.get("decision", "unknown")
-            confidence = float(parsed.get("confidence", 0.0))
-            reasoning = parsed.get("reasoning", "")
-
-            print(f"[llm-agent] LLM decision: {decision} (confidence: {confidence})")
-
-            set_success(current_span, decision=decision, confidence=confidence)
-            return {
-                "llm_decision": decision,
-                "llm_confidence": confidence,
-                "llm_reasoning": reasoning,
+        # Langfuse: начать LLM generation
+        with llm_generation(
+            name="llm-agent",
+            model=OLLAMA_MODEL,
+            input_data={"prompt": prompt, "amount": amount, "comment": comment},
+            metadata={
+                "trace_id": trace_id or "unknown",
                 "agent_svid": LLM_AGENT_SVID,
-            }
+            },
+        ) as gen:
+            try:
+                async with httpx.AsyncClient(timeout=180.0) as client:
+                    response = await client.post(
+                        f"{OLLAMA_HOST}/api/generate",
+                        json={
+                            "model": OLLAMA_MODEL,
+                            "prompt": prompt,
+                            "stream": False,
+                            "format": "json",
+                        },
+                    )
+                    response.raise_for_status()
+                    data = response.json()
 
-        except Exception as e:
-            print(f"[llm-agent] ERROR: {e}")
-            current_span.set_attribute("error", str(e))
-            return {
-                "llm_decision": "error",
-                "llm_confidence": 0.0,
-                "llm_reasoning": str(e),
-                "agent_svid": LLM_AGENT_SVID,
-            }
+                raw_response = data.get("response", "{}")
+                print(f"[llm-agent] Ollama response: {raw_response[:300]}")
+
+                parsed = json.loads(raw_response)
+
+                decision = parsed.get("decision", "unknown")
+                confidence = float(parsed.get("confidence", 0.0))
+                reasoning = parsed.get("reasoning", "")
+
+                print(f"[llm-agent] LLM decision: {decision} (confidence: {confidence})")
+
+                # Langfuse: записать результат
+                gen["output"] = parsed
+                gen["usage"] = {
+                    "input": data.get("prompt_eval_count", 0),
+                    "output": data.get("eval_count", 0),
+                    "unit": "TOKENS",
+                }
+                gen["metadata"] = {
+                    "decision": decision,
+                    "confidence": confidence,
+                }
+
+                set_success(current_span, decision=decision, confidence=confidence)
+                return {
+                    "llm_decision": decision,
+                    "llm_confidence": confidence,
+                    "llm_reasoning": reasoning,
+                    "agent_svid": LLM_AGENT_SVID,
+                }
+
+            except Exception as e:
+                print(f"[llm-agent] ERROR: {e}")
+                current_span.set_attribute("error", str(e))
+                gen["output"] = {"error": str(e)}
+                return {
+                    "llm_decision": "error",
+                    "llm_confidence": 0.0,
+                    "llm_reasoning": str(e),
+                    "agent_svid": LLM_AGENT_SVID,
+                }
 
 
 async def handle_tool_executor(job: Job) -> dict[str, Any]:
@@ -194,7 +218,6 @@ async def handle_tool_executor(job: Job) -> dict[str, Any]:
         print(f"  confidence = {llm_confidence}")
         print(f"  svid       = {agent_svid}")
 
-        # Build RecommendationDTO
         try:
             dto = RecommendationDTO(
                 tool_name=ToolName.SEND_NOTIFICATION,
@@ -211,7 +234,6 @@ async def handle_tool_executor(job: Job) -> dict[str, Any]:
                 "policy_reason": f"Invalid RecommendationDTO: {e}",
             }
 
-        # Policy checks
         reasons = []
         allowed = True
 
@@ -260,12 +282,6 @@ async def handle_tool_executor(job: Job) -> dict[str, Any]:
 async def handle_mcp_gateway(job: Job) -> dict[str, Any]:
     """
     MCP Gateway - call legacy systems via Model Context Protocol.
-
-    Input:
-        policy_decision, amount, comment
-
-    Output:
-        mcp_status, mcp_notice_id, mcp_message
     """
     variables = job.variables
     policy_decision = variables.get("policy_decision", "DENY")
