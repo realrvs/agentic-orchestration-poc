@@ -182,6 +182,28 @@ Policy Engine:
 
 ---
 
+## Observability Stack
+
+Полный контур observability реализован в `agentic-orchestration-poc`:
+
+| Слой | Инструмент | Что даёт |
+|------|-----------|----------|
+| **Distributed Tracing** | Jaeger + OpenTelemetry | Timing, bottleneck, trace через все слои |
+| **LLM Observability** | Langfuse | Prompt, output, tokens, cost, latency |
+| **Metrics** | Prometheus | Counters, histograms, aggregates |
+| **Visualization** | Grafana | Dashboards для CTO |
+| **Audit Log** | PostgreSQL (append-only) | RBAC decisions, hash-chain (roadmap) |
+
+### Verified Metrics
+
+- **`task_total`** — 5 task types (validate, approve, llm, tool, mcp)
+- **`policy_decision_total`** — ALLOW/DENY counter
+- **`llm_confidence`** — histogram (avg 0.9)
+- **`task_duration_seconds`** — histogram (P95 доступен)
+- **`mcp_call_total`** — MCP Gateway calls by status
+
+---
+
 ## Setup
 
 ### Prerequisites
