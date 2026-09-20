@@ -1,0 +1,19 @@
+﻿global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: poc
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Python worker metrics (from host machine)
+  # Worker runs on host, exposes metrics on port 8002
+  - job_name: 'agentic-worker'
+    static_configs:
+      - targets: ['host.docker.internal:8002']
+        labels:
+          service: 'agentic-orchestration-worker'

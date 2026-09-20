@@ -170,6 +170,43 @@ services:
     networks:
       - poc-network
 
+  # ─── Prometheus (метрики) ───────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: poc-prometheus
+    profiles: ["obs", "full"]
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    networks:
+      - poc-network
+
+  # ─── Grafana (визуализация) ─────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: poc-grafana
+    profiles: ["obs", "full"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./infra/grafana-dashboards:/etc/grafana/provisioning/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - poc-network
+
   # ─── MCP Gateway (единая точка входа для агентов) ───────────────
   mcp-gateway:
     build:
@@ -231,6 +268,8 @@ volumes:
   camunda-data:
   ollama-data:
   elasticsearch-data:
+  prometheus-data:
+  grafana-data:     
 
 networks:
   poc-network:
