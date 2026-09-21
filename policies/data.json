@@ -1,0 +1,17 @@
+{
+  "allowed_svids": [
+    "spiffe://company.ru/agents/llm_agent_v1",
+    "spiffe://cluster.local/ns/default/sa/langgraph-agent"
+  ],
+  "confidence_threshold": 0.85,
+  "allowed_tools": [
+    "send-notification",
+    "archive-documents",
+    "publish_notice"
+  ],
+  "limits": {
+    "max_amount": 50000000,
+    "allowed_regions": ["Moscow", "SPb", "Kazan"],
+    "allowed_categories": ["IT", "office", "services"]
+  }
+}

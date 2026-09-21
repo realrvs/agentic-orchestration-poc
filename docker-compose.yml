@@ -207,6 +207,24 @@ services:
     networks:
       - poc-network
 
+  # ─── OPA (Open Policy Agent) ────────────────────────────────────
+  opa:
+    image: openpolicyagent/opa:0.69.0
+    container_name: poc-opa
+    profiles: ["core", "obs", "full"]
+    ports:
+      - "8181:8181"
+    volumes:
+      - ./policies:/policies:ro
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "--log-level=info"
+      - "/policies"
+    networks:
+      - poc-network
+
   # ─── MCP Gateway (единая точка входа для агентов) ───────────────
   mcp-gateway:
     build:
