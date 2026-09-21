@@ -5,13 +5,16 @@ Handles Service Tasks:
 - validate-request: mock validation of incoming request
 - approve-request: auto-approve (replaces User Task for PoC)
 - llm-agent: LLM-based analysis via local Ollama (Mistral 7B)
-- tool-executor: Policy Enforcement Point (RBAC + confidence threshold)
+- tool-executor: Policy Enforcement Point (OPA/Rego)
 - mcp-gateway: MCP Gateway integration for legacy systems
 
 Observability:
 - OpenTelemetry tracing to Jaeger (localhost:4318)
 - Langfuse LLM observability (localhost:3001)
 - Prometheus metrics (localhost:8002)
+
+Policy:
+- ABAC via OPA/Rego (localhost:8181)
 """
 
 import asyncio
@@ -23,12 +26,6 @@ import httpx
 from pyzeebe import ZeebeWorker, Job
 from pyzeebe.channel import create_insecure_channel
 
-from tool_contract import (
-    RecommendationDTO,
-    ToolName,
-    CONFIDENCE_THRESHOLD,
-    ALLOWED_SVIDS,
-)
 from tracing import setup_tracing, span, set_success
 from langfuse_client import llm_generation
 from metrics import (
@@ -45,8 +42,39 @@ CAMUNDA_ADDRESS = os.getenv("CAMUNDA_ZEEBE_GATEWAY_ADDRESS", "localhost:26500")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b-instruct-q4_K_M")
 MCP_GATEWAY_URL = os.getenv("MCP_GATEWAY_URL", "http://localhost:8000")
+OPA_URL = os.getenv("OPA_URL", "http://localhost:8181")
 
 LLM_AGENT_SVID = "spiffe://company.ru/agents/llm_agent_v1"
+
+
+# ─── OPA client ───────────────────────────────────────────────────
+
+async def call_opa(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Call OPA policy decision.
+
+    Returns:
+        {"allow": bool, "reason": str}
+    """
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{OPA_URL}/v1/data/tool_executor/allow",
+            json={"input": payload},
+        )
+        response.raise_for_status()
+        allow_data = response.json()
+        allow = allow_data.get("result", False)
+
+        # Получить reason
+        reason_response = await client.post(
+            f"{OPA_URL}/v1/data/tool_executor/reason",
+            json={"input": payload},
+        )
+        reason_response.raise_for_status()
+        reason_data = reason_response.json()
+        reason = reason_data.get("result", "no reason provided")
+
+    return {"allow": allow, "reason": reason}
 
 
 # ─── Task handlers ────────────────────────────────────────────────
@@ -102,11 +130,7 @@ async def handle_approve_request(job: Job) -> dict[str, Any]:
 
 
 async def handle_llm_agent(job: Job) -> dict[str, Any]:
-    """
-    LLM agent - analyze request using local Ollama.
-
-    Traced to Jaeger (timing), Langfuse (content), Prometheus (metrics).
-    """
+    """LLM agent - analyze request using local Ollama."""
     variables = job.variables
     amount = variables.get("amount", 0)
     comment = variables.get("comment", "")
@@ -212,78 +236,80 @@ async def handle_llm_agent(job: Job) -> dict[str, Any]:
 
 async def handle_tool_executor(job: Job) -> dict[str, Any]:
     """
-    Policy Enforcement Point - validate LLM recommendation.
+    Policy Enforcement Point - call OPA for decision.
+
+    Input from BPMN:
+        llm_decision, llm_confidence, llm_reasoning, agent_svid, amount, comment
+
+    OPA returns:
+        allow (bool), reason (str)
     """
     variables = job.variables
     llm_decision = variables.get("llm_decision", "unknown")
     llm_confidence_val = float(variables.get("llm_confidence", 0.0))
     llm_reasoning = variables.get("llm_reasoning", "")
     agent_svid = variables.get("agent_svid", LLM_AGENT_SVID)
+    amount = variables.get("amount", 0)
     trace_id = variables.get("trace_id")
+
+    # Для PoC: category и region — заглушки
+    category = variables.get("category", "IT")
+    region = variables.get("region", "Moscow")
 
     with task_duration_seconds.labels(task_type="tool-executor").time():
         with span("tool-executor", trace_id=trace_id, attributes={
             "confidence": llm_confidence_val,
             "svid": agent_svid,
+            "amount": amount,
+            "region": region,
+            "category": category,
         }) as current_span:
             print(f"[tool-executor] Evaluating recommendation:")
             print(f"  decision   = {llm_decision}")
             print(f"  confidence = {llm_confidence_val}")
             print(f"  svid       = {agent_svid}")
+            print(f"  amount     = {amount}")
+            print(f"  region     = {region}")
+            print(f"  category   = {category}")
+
+            # Payload для OPA
+            opa_input = {
+                "agent_svid": agent_svid,
+                "confidence": llm_confidence_val,
+                "tool_name": "send-notification",  # allow-list из data.json
+                "amount": amount,
+                "region": region,
+                "category": category,
+            }
 
             try:
-                dto = RecommendationDTO(
-                    tool_name=ToolName.SEND_NOTIFICATION,
-                    confidence=llm_confidence_val,
-                    reasoning=llm_reasoning or "no reasoning provided",
-                    parameters={},
-                    agent_svid=agent_svid,
-                )
+                opa_result = await call_opa(opa_input)
+                allow = opa_result["allow"]
+                opa_reason = opa_result["reason"]
             except Exception as e:
-                print(f"[tool-executor] INVALID DTO: {e}")
+                print(f"[tool-executor] OPA ERROR: {e}")
                 policy_decision_total.labels(decision="DENY").inc()
                 task_total.labels(task_type="tool-executor", status="error").inc()
-                set_success(current_span, decision="DENY", reason="invalid_dto")
+                set_success(current_span, decision="DENY", reason="opa_error")
                 return {
                     "policy_decision": "DENY",
-                    "policy_reason": f"Invalid RecommendationDTO: {e}",
+                    "policy_reason": f"OPA call failed: {e}",
                 }
 
-            reasons = []
-            allowed = True
+            policy_decision = "ALLOW" if allow else "DENY"
 
-            if dto.agent_svid not in ALLOWED_SVIDS:
-                allowed = False
-                reasons.append(f"SVID not in allow-list: {dto.agent_svid}")
-            else:
-                reasons.append("SVID OK")
-
-            if dto.confidence < CONFIDENCE_THRESHOLD:
-                allowed = False
-                reasons.append(
-                    f"Confidence {dto.confidence:.2f} < threshold {CONFIDENCE_THRESHOLD:.2f}"
-                )
-            else:
-                reasons.append(f"Confidence OK ({dto.confidence:.2f})")
-
-            reasons.append(f"Tool OK ({dto.tool_name.value})")
-
-            if dto.confidence < CONFIDENCE_THRESHOLD and llm_decision == "approve":
-                allowed = False
-                reasons.append("LLM approved but confidence below threshold")
-
-            policy_reason = "; ".join(reasons)
-            policy_decision = "ALLOW" if allowed else "DENY"
-
-            print(f"[tool-executor] Policy decision: {policy_decision}")
-            print(f"[tool-executor] Reason: {policy_reason}")
+            print(f"[tool-executor] OPA decision: {policy_decision}")
+            print(f"[tool-executor] OPA reason: {opa_reason}")
 
             audit_entry = {
-                "agent_svid": dto.agent_svid,
-                "tool": dto.tool_name.value,
-                "confidence": dto.confidence,
+                "agent_svid": agent_svid,
+                "tool": "send-notification",
+                "confidence": llm_confidence_val,
+                "amount": amount,
+                "region": region,
+                "category": category,
                 "decision": policy_decision,
-                "reason": policy_reason,
+                "reason": opa_reason,
             }
             print(f"[AUDIT] {json.dumps(audit_entry, ensure_ascii=False)}")
 
@@ -293,7 +319,7 @@ async def handle_tool_executor(job: Job) -> dict[str, Any]:
             set_success(current_span, decision=policy_decision)
             return {
                 "policy_decision": policy_decision,
-                "policy_reason": policy_reason,
+                "policy_reason": opa_reason,
             }
 
 
@@ -392,6 +418,8 @@ async def main() -> None:
     start_metrics_server()
 
     print(f"Connecting to Zeebe at {CAMUNDA_ADDRESS}...")
+    print(f"OPA URL: {OPA_URL}")
+
     hostname, port = CAMUNDA_ADDRESS.split(":")
     channel = create_insecure_channel(hostname=hostname, port=int(port))
     worker = ZeebeWorker(channel)
@@ -406,7 +434,7 @@ async def main() -> None:
     print("  - validate-request")
     print("  - approve-request")
     print(f"  - llm-agent (model: {OLLAMA_MODEL})")
-    print("  - tool-executor (Policy Enforcement Point)")
+    print(f"  - tool-executor (Policy Enforcement Point -> {OPA_URL})")
     print(f"  - mcp-gateway (MCP Gateway: {MCP_GATEWAY_URL})")
     print()
 
